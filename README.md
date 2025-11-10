@@ -1,4 +1,4 @@
-## ELBO-KTO: Training Code (Supplementary)
+## ELBO-KTO: Training Code
 
 This repository contains the minimal code to reproduce ELBO-KTO training in two stages:
 
@@ -102,3 +102,16 @@ Notes:
 - The script installs required versions of `transformers`, `lm_eval`, and `accelerate`.
 - Set `LLADA_INSTRUCT` inside the script to your model path (e.g., `GSAI-ML/LLaDA-8B-Instruct`).
 - Generation knobs like `gen_length`, `steps`, and `block_length` are passed through `--model_args` and can be adjusted per task.
+
+## Cite this work
+```
+@misc{jindal2025aligningdiffusionlanguagemodels,
+      title={Aligning Diffusion Language Models via Unpaired Preference Optimization}, 
+      author={Vaibhav Jindal and Hejian Sang and Chun-Mao Lai and Yanning Chen and Zhipeng Wang},
+      year={2025},
+      eprint={2510.23658},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2510.23658}, 
+}
+```
