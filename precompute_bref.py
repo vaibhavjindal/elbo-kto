@@ -189,15 +189,17 @@ def bref_for_batch(
     model: AutoModel,
     input_ids_batch: torch.LongTensor,    # [B, L]
     prompt_lens: List[int],               # [B]
-    comp_lens: List[int],                 # [B]  <-- NEW
+    comp_lens: List[int],                 # [B]
     base_seeds: List[int],                # [B]
-    K_max: int,
+    k_total: int,
+    num_timesteps: int,
 ) -> List[Dict[str, Any]]:
     """
     Compute fixed-l estimator with response-only masking for a batch of sequences.
     
-    For each example, computes B_ref estimates using deterministic masking within
-    the response window. Uses K_max draws with running prefix means.
+    The total number of MC draws is `k_total`. The draws are divided into
+    `num_timesteps` groups, each sharing the same ℓ value. Every group contains
+    `samples_per_timestep = k_total / num_timesteps` draws with distinct masks.
     
     Args:
         model: Pre-trained language model
@@ -205,31 +207,50 @@ def bref_for_batch(
         prompt_lens: List of prompt lengths per example [B]
         comp_lens: List of completion lengths per example [B]
         base_seeds: List of base seeds for deterministic generation [B]
-        K_max: Maximum number of draws K for estimation
+        k_total: Total number of draws per example
+        num_timesteps: Number of unique ℓ values per example
         
     Returns:
         List of dictionaries (length B), each containing:
-        - "l_values": List of l values used for each draw [l_1, ..., l_K_max]
-        - "B_prefix": List of prefix means [mean_1, ..., mean_K_max]  
+        - "l_values": List of l values used for each draw [l_1, ..., l_k_total]
+        - "B_prefix": List of prefix means [mean_1, ..., mean_k_total]  
         - "masked_idx_sums": List of sums of masked indices per draw
     """
     device = input_ids_batch.device
     B, L = input_ids_batch.shape
+    if num_timesteps <= 0:
+        raise ValueError("num_timesteps must be positive")
+    if k_total <= 0:
+        raise ValueError("k_total must be positive")
+    if k_total % num_timesteps != 0:
+        raise ValueError("k_total must be divisible by num_timesteps")
+    samples_per_timestep = k_total // num_timesteps
 
     # Prepare containers for results
     per_ex = [{"l_values": [], "per_draw": [], "masked_idx_sums": []} for _ in range(B)]
     running = torch.zeros(B, device=device, dtype=torch.float64)
 
-    for k in range(1, K_max + 1):
+    # Pre-sample ℓ per timestep for every example (deterministic)
+    timestep_l_values: List[List[int]] = []
+    for b in range(B):
+        base = int(base_seeds[b])
+        comp_len = int(comp_lens[b])
+        per_ts = []
+        for t in range(1, num_timesteps + 1):
+            l_seed = derive_seed(base, t, tag=0)
+            per_ts.append(int(l_from_seed(l_seed, comp_len)))
+        timestep_l_values.append(per_ts)
+
+    for draw_idx in range(k_total):
+        timestep_idx = draw_idx // samples_per_timestep
+        # Derive ℓ (shared within timestep) and selection seeds (per draw)
         # Derive ℓ and selection seed deterministically for each example
         l_values_k, select_seeds_k = [], []
         for b in range(B):
             base = int(base_seeds[b])
-            L_resp = int(comp_lens[b])
-            l_seed = derive_seed(base, k, tag=0)   # drives l
-            sel_seed = derive_seed(base, k, tag=1)  # drives which positions
-            l = l_from_seed(l_seed, L_resp)
+            l = timestep_l_values[b][timestep_idx]
             l_values_k.append(l)
+            sel_seed = derive_seed(base, draw_idx + 1, tag=1)  # unique per draw
             select_seeds_k.append(sel_seed)
 
         # Build masks (exactly ℓ masked positions inside the response window)
@@ -244,7 +265,7 @@ def bref_for_batch(
 
         # Accumulate prefix means
         running += torch.tensor(draw_vals, device=device, dtype=torch.float64)
-        means = (running / float(k)).tolist()
+        means = (running / float(draw_idx + 1)).tolist()
 
         # Store results for this draw
         for b in range(B):
@@ -346,8 +367,9 @@ def resolve_mask_id(tokenizer, model=None, cli_mask_id=None, cli_mask_token=None
     raise ValueError("Could not resolve mask_token_id. Provide --mask_id or --mask_token.")
 
 
-def worker_process(gpu_id: int, model_path: str, dataset_arg: str, split: str, K_vals: List[int], 
-                   work_range: tuple, batch_size: int, output_dir: str, worker_id: int):
+def worker_process(gpu_id: int, model_path: str, dataset_arg: str, split: str, k_val: int,
+                   num_timesteps: int, work_range: tuple, batch_size: int,
+                   output_dir: str, worker_id: int):
     """
     Worker process for multi-GPU processing. Each worker processes a subset of examples
     on its assigned GPU and writes results to a separate file.
@@ -401,7 +423,7 @@ def worker_process(gpu_id: int, model_path: str, dataset_arg: str, split: str, K
         
         start_idx, end_idx = work_range
         total_examples = end_idx - start_idx
-        K_max = max(K_vals)
+        K_max = k_val
         
         with open(worker_output_file, "w", encoding="utf-8") as f_out:
             # Process this worker's subset in batches
@@ -435,8 +457,13 @@ def worker_process(gpu_id: int, model_path: str, dataset_arg: str, split: str, K
                 
                 # Compute B_ref values for the entire batch
                 batch_results = bref_for_batch(
-                    model, input_ids_batch, prompt_lens, comp_lens,
-                    batch_base_seeds, K_max
+                    model,
+                    input_ids_batch,
+                    prompt_lens,
+                    comp_lens,
+                    batch_base_seeds,
+                    k_total=K_max,
+                    num_timesteps=num_timesteps,
                 )
                 
                 # Write results for each example in the batch
@@ -446,8 +473,8 @@ def worker_process(gpu_id: int, model_path: str, dataset_arg: str, split: str, K
                     res = batch_results[i]
                     orig = orig_data[i]
                     
-                    # Select only requested K values
-                    B_ref_map = {str(K): float(res["B_prefix"][K - 1]) for K in K_vals}
+                    # Select final B_ref for requested K value
+                    B_ref_map = {str(k_val): float(res["B_prefix"][K_max - 1])}
                     
                     rec = {
                         "index": idx,
@@ -503,8 +530,9 @@ def merge_worker_outputs(output_files: List[str], final_output_path: str):
 
 # ====== Main Functions ======
 
-def main(model_path: str, dataset_arg: str, K_vals: List[int], output_file_path: str, 
-         batch_size: int = 1, num_gpus: int = None, max_samples: int = None, split: str = "train"):
+def main(model_path: str, dataset_arg: str, k_val: int, num_timesteps: int,
+         output_file_path: str, batch_size: int = 1, num_gpus: int = None,
+         max_samples: int = None, split: str = "train"):
     """
     Multi-GPU implementation using multiprocessing. Each GPU gets a separate process
     that handles a subset of the dataset. For single GPU usage, set num_gpus=1.
@@ -552,8 +580,18 @@ def main(model_path: str, dataset_arg: str, K_vals: List[int], output_file_path:
             
         p = mp.Process(
             target=worker_process,
-            args=(gpu_id, model_path, dataset_arg, split, K_vals, work_range, batch_size, 
-                  str(output_dir), worker_id)
+            args=(
+                gpu_id,
+                model_path,
+                dataset_arg,
+                split,
+                k_val,
+                num_timesteps,
+                work_range,
+                batch_size,
+                str(output_dir),
+                worker_id,
+            )
         )
         p.start()
         processes.append(p)
@@ -594,21 +632,23 @@ if __name__ == "__main__":
         epilog="""
 Examples:
   # Use all available GPUs (default)
-  python precompute_bref.py --model_path model/ --dataset data.jsonl --k_vals 1,4,8 --output_file out.jsonl
+  python precompute_bref.py --model_path model/ --dataset data.jsonl --k_val 8 --num_timestep 4 --output_file out.jsonl
   
   # Use single GPU
-  python precompute_bref.py --num_gpus 1 --model_path model/ --dataset data/ --k_vals 1,4,8 --output_file out.jsonl
+  python precompute_bref.py --num_gpus 1 --model_path model/ --dataset data/ --k_val 8 --num_timestep 4 --output_file out.jsonl
   
   # Use only 2 GPUs with larger batches and limit to 1000 samples
-  python precompute_bref.py --num_gpus 2 --batch_size 8 --max_samples 1000 --model_path model/ --dataset data/ --k_vals 1,4,8 --output_file out.jsonl
+  python precompute_bref.py --num_gpus 2 --batch_size 8 --max_samples 1000 --model_path model/ --dataset data/ --k_val 8 --num_timestep 4 --output_file out.jsonl
         """
     )
     parser.add_argument("--model_path", type=str, required=True,
                         help="Path to model directory or HuggingFace model name")
     parser.add_argument("--dataset", type=str, required=True,
                         help="HF hub name, local HF dataset dir (load_from_disk), or JSON/JSONL file")
-    parser.add_argument("--k_vals", type=str, required=True, 
-                        help="Comma-separated list of K values, e.g. '1,4,8'")
+    parser.add_argument("--k_val", type=int, required=True,
+                        help="Total number of MC samples (must be divisible by num_timesteps)")
+    parser.add_argument("--num_timestep", type=int, required=True, dest="num_timesteps",
+                        help="Number of unique ℓ samples per example")
     parser.add_argument("--output_file", type=str, required=True, 
                         help="Output JSONL file path")
     parser.add_argument("--batch_size", type=int, default=1, 
@@ -634,16 +674,20 @@ Examples:
     print(f"Batch size per GPU: {args.batch_size}")
     print(f"Dataset: {args.dataset}")
     print(f"Model: {args.model_path}")
-    print(f"K values: {args.k_vals}")
+    print(f"K value: {args.k_val}")
+    print(f"Num timesteps: {args.num_timesteps}")
     print(f"Output: {args.output_file}")
     if args.max_samples:
         print(f"Max samples: {args.max_samples}")
     print("=" * 60)
 
-    # Parse K values
-    K_vals = [int(x) for x in args.k_vals.split(",") if x.strip()]
-    
     # Validate arguments
+    if args.k_val <= 0:
+        parser.error("--k_val must be positive")
+    if args.num_timesteps <= 0:
+        parser.error("--num_timesteps must be positive")
+    if args.k_val % args.num_timesteps != 0:
+        parser.error("--k_val must be divisible by --num_timesteps")
     if args.num_gpus is not None:
         if args.num_gpus <= 0:
             parser.error("--num_gpus must be positive")
@@ -657,5 +701,14 @@ Examples:
         pass  # Already set
     
     # Run main function
-    main(args.model_path, args.dataset, K_vals, args.output_file, 
-         args.batch_size, args.num_gpus, args.max_samples, args.split)
+    main(
+        args.model_path,
+        args.dataset,
+        args.k_val,
+        args.num_timesteps,
+        args.output_file,
+        args.batch_size,
+        args.num_gpus,
+        args.max_samples,
+        args.split,
+    )

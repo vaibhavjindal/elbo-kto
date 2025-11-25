@@ -31,7 +31,8 @@ python precompute_bref.py \
   --batch_size 8 \
   --model_path GSAI-ML/LLaDA-8B-Instruct \
   --dataset data/kto-mix-14k \
-  --k_vals 1,2,4,8 \
+  --k_val 8 \
+  --num_timestep 4 \
   --output_file data/kto-mix-14k-processed/train.jsonl \
   --split train \
   --max_samples 64
@@ -39,6 +40,8 @@ python precompute_bref.py \
 
 Notes:
 - `--dataset` should be a local HF dataset directory.
+- `--k_val` is the total number of MC samples per example, and must be divisible by `--num_timestep`.
+- `--num_timestep` controls how many unique ℓ samples are used; each timestep contributes `k_val / num_timestep` draws with different masks.
 - The output file will contain precomputed fields: `seed`, `l_values`, `B_ref` (per-K), and `masked_idx_sums`.
 
 ### 4) Train with ELBO-KTO
@@ -58,7 +61,7 @@ torchrun --nproc_per_node=8 train.py \
 
 Key points:
 - `--train_dataset_path` must point to the JSONL created in the precompute step.
-- `--n_mc_samples` must be one of the K values you precomputed.
+- `--n_mc_samples` must match the `--k_val` used during precomputation.
 
 ### 5) Reproducibility
 - Mask generation is deterministic per example using fixed 64-bit seeds; training re-derives the same per-draw masks and verifies them (configurable).
