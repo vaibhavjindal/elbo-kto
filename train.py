@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, argparse
+import random
 from contextlib import nullcontext
 from typing import List, Optional
 
@@ -18,6 +19,20 @@ from transformers import (
 from data_utils import DataProcessorPreprocessed
 
 MAX_LENGTH = 4096
+
+
+def str2bool(v):
+    """
+    Argparse helper that accepts common boolean strings.
+    """
+    if isinstance(v, bool):
+        return v
+    v_lower = str(v).lower()
+    if v_lower in ("yes", "true", "t", "1"):
+        return True
+    if v_lower in ("no", "false", "f", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected (true/false).")
 # =========================
 # Custom Data Collator
 # =========================
@@ -33,7 +48,7 @@ def kto_data_collator(features):
     batch = {}
     
     # Simple tensor fields that can be stacked directly
-    simple_fields = ['input_ids', 'prompt_length', 'completion_length', 'labels']
+    simple_fields = ['input_ids', 'prompt_length', 'completion_length', 'labels', 'index']
     
     for field in simple_fields:
         if field in features[0]:
@@ -110,6 +125,13 @@ def mix64(x: int) -> int:
 def derive_seed(base_seed: int, k: int, tag: int) -> int:
     x = base_seed ^ (k * 0x9E3779B97F4A7C15) ^ (tag * 0xD1342543DE82EF95)
     return mix64(x)
+
+
+def l_from_seed(seed: int, resp_len: int) -> int:
+    """Uniformly sample ℓ ∈ [1, resp_len] (or 0 if resp_len <= 0) from a 64-bit seed."""
+    if resp_len <= 0:
+        return 0
+    return 1 + (mix64(seed) % resp_len)
 
 # ==========================================================
 # Mask building (fixed-ℓ in response window; must match precompute)
@@ -244,19 +266,41 @@ class ELBOKTOTrainer(Trainer):
         mask_token_id = getattr(self, "mask_token_id", None)
         if mask_token_id is None:
             raise ValueError("mask_token_id must be set on the trainer for masking.")
+        share_random_numbers = getattr(self, "share_random_numbers", True)
 
         # tensors
         x = inputs["input_ids"].to(model.device).long()          # [B,L]
         pl = inputs["prompt_length"].to(model.device).long()     # [B]
         cl = inputs["completion_length"].to(model.device).long() # [B]
         y  = inputs["labels"].to(model.device).long()            # [B]
-        # Convert string seeds back to integers (stored as strings to avoid PyArrow overflow)
-        seed_strings = inputs["seed"]  # [B] list of strings 
-        # print("seed_strings: ", seed_strings)
-        base_seed_ints = [int(s) for s in seed_strings]  # Keep as Python ints to avoid tensor overflow
-        # print("base_seed_ints: ", base_seed_ints)
-        l_values = inputs["l_values"].to(model.device).long()    # [B,Kmax]
-        # print("l_values: ", l_values)
+        Bsz, L = x.shape
+        if share_random_numbers:
+            seed_strings = inputs["seed"]  # [B] list of strings
+            base_seed_ints = [int(s) for s in seed_strings]
+            l_values_tensor = inputs["l_values"].to(model.device).long()    # [B,Kmax]
+        else:
+            mask64 = 0xFFFFFFFFFFFFFFFF
+            args_seed = int(getattr(getattr(self, "args", None), "seed", 42)) & mask64
+            index_tensor = inputs.get("index", None)
+            if index_tensor is not None:
+                if isinstance(index_tensor, torch.Tensor):
+                    index_list = [int(v) for v in index_tensor.view(-1).tolist()]
+                else:
+                    index_list = [int(v) for v in index_tensor]
+            else:
+                # Fallback to batch order if index is unavailable
+                index_list = list(range(x.shape[0]))
+            base_seed_ints = []
+            for offset, idx in enumerate(index_list):
+                mix_in = (args_seed + (idx + 1) * 0x9E3779B97F4A7C15 + offset) & mask64
+                base_seed_ints.append(mix64(mix_in))
+            l_values_tensor = torch.zeros((Bsz, K), dtype=torch.long, device=model.device)
+            for b, base_seed_int in enumerate(base_seed_ints):
+                comp_len_b = int(cl[b].item())
+                for k_idx in range(1, K + 1):
+                    l_seed = derive_seed(base_seed_int, k_idx, tag=0)
+                    l_values_tensor[b, k_idx - 1] = l_from_seed(l_seed, comp_len_b)
+
         idx_sums = inputs["masked_idx_sums"].to(model.device).long()  # [B,Kmax]
         # Use B_ref value corresponding to n_mc_samples (K)
         bkey = f"B_ref_{K}"
@@ -265,8 +309,7 @@ class ELBOKTOTrainer(Trainer):
             raise KeyError(f"Missing precomputed {bkey} in batch. Available: {available_keys}. Ensure precompute_bref.py included this K and that n_mc_samples matches.")
         bref_K   = inputs[bkey].to(model.device).float()     # [B]
 
-        Bsz, L = x.shape
-        assert l_values.shape[1] >= K and idx_sums.shape[1] >= K, \
+        assert l_values_tensor.shape[1] >= K and idx_sums.shape[1] >= K, \
             "Dataset l_values/masked_idx_sums must have at least n_mc_samples columns"
 
         # cache targets once
@@ -281,19 +324,11 @@ class ELBOKTOTrainer(Trainer):
             # derive selection seeds (tag=1; must match precompute)
             select_seeds = []
             for b in range(Bsz):
-                # Use Python int directly to avoid tensor overflow issues
                 base_seed_int = base_seed_ints[b]
                 derived_seed = derive_seed(base_seed_int, k, tag=1)
                 select_seeds.append(derived_seed)
-            
-            # Pass seeds as list to avoid overflow when converting to tensor
-            
-            # Alternative: If you want to use tensors, apply mask first to prevent overflow:
-            # masked_seeds = [s & 0x7FFFFFFFFFFFFFFF for s in select_seeds]  # Force to signed int64 range
-            # select_seeds = torch.tensor(masked_seeds).to(x.device)
 
-            # take the stored ℓ for this draw
-            l_k = l_values[:, k - 1]  # [B]
+            l_k = l_values_tensor[:, k - 1]  # [B]
 
             # build masks (exactly ℓ masked tokens in response window)
             masks = make_fixedl_masks_batched(
@@ -430,9 +465,8 @@ def parse_args():
     p.add_argument("--kto_lambda_D", type=float, default=1.0)
     p.add_argument("--kto_lambda_U", type=float, default=1.0)
     p.add_argument("--z0_mode", type=str, default="global_mean", choices=["global_mean", "zero"])
-    p.add_argument("--verify_masks", action="store_true", default=True)
-    p.add_argument("--disable_mask_verification", action="store_true", default=False,
-                   help="Disable mask verification for faster training (production mode)")
+    p.add_argument("--verify_masks", type=str2bool, default=True,
+                   help="Check that reconstructed masks match the dataset checksums (default: true).")
 
     # Dataset module path/hints:
     p.add_argument("--train_dataset_path", type=str, required=True,
@@ -447,6 +481,10 @@ def parse_args():
                    help="Ratio of negative samples (labels=0) to use for training. Range: [0.0, 1.0]. E.g., 0.1 uses 10%% of negative samples, 0.0 uses none")
     p.add_argument("--sample_seed", type=int, default=42,
                    help="Random seed for reproducible dataset sampling when n_D or n_U < 1.0")
+    p.add_argument("--share_random_numbers", type=str2bool, default=False,
+                   help="When true, reuse the dataset-provided random numbers; when false (default), "
+                        "deterministically resample ℓ values and masks from scratch, which makes mask "
+                        "verification fail because the stored checksums no longer match.")
 
     return p.parse_args()
 
@@ -607,7 +645,8 @@ def main():
     trainer.kto_lambda_D = args.kto_lambda_D
     trainer.kto_lambda_U = args.kto_lambda_U
     trainer.z0_mode = args.z0_mode
-    trainer.verify_masks = args.verify_masks and not args.disable_mask_verification
+    trainer.verify_masks = args.verify_masks
+    trainer.share_random_numbers = args.share_random_numbers
 
     # Generalization runtime ids
     trainer.mask_token_id = _resolve_mask_token_id(tok, model)

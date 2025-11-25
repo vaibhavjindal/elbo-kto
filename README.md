@@ -62,6 +62,7 @@ torchrun --nproc_per_node=8 train.py \
 Key points:
 - `--train_dataset_path` must point to the JSONL created in the precompute step.
 - `--n_mc_samples` must match the `--k_val` used during precomputation.
+- `--share_random_numbers false` (default) deterministically resamples ℓ values and mask RNG from scratch instead of reusing the dataset seeds. This intentionally causes mask verification to fail; pass `--verify_masks false` if you want to bypass the check.
 
 ### 5) Reproducibility
 - Mask generation is deterministic per example using fixed 64-bit seeds; training re-derives the same per-draw masks and verifies them (configurable).
