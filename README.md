@@ -59,6 +59,7 @@ torchrun --nproc_per_node=8 train.py \
 Key points:
 - `--train_dataset_path` must point to the JSONL created in the precompute step.
 - `--n_mc_samples` must be one of the K values you precomputed.
+- `--centering_group_size` (alias `--cgs`) controls the KTO centering baseline `z0` when `--z0_mode=global_mean`. Default `0` centers every sample by a single global-batch mean (paper default). Setting it to `g` partitions the rank-ordered global batch (`world_size × per_device_train_batch_size`) into contiguous groups of size `g` and centers each sample by its own group mean — e.g. with global batch 8, `--cgs 2` gives 4 groups of 2. The global batch must be divisible by `cgs`; `cgs=1` zeroes the training signal.
 
 ### 5) Reproducibility
 - Mask generation is deterministic per example using fixed 64-bit seeds; training re-derives the same per-draw masks and verifies them (configurable).

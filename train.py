@@ -179,6 +179,7 @@ class ELBOKTOTrainer(Trainer):
     kto_lambda_D: float = 1.0
     kto_lambda_U: float = 1.0
     z0_mode: str = "global_mean"  # or "zero"
+    centering_group_size: int = 0  # 0/off => single global mean; >0 => group the global batch into contiguous chunks of this size and center within each
 
     # Extra runtime attributes set by runner for generalization
     mask_token_id: Optional[int] = None
@@ -194,6 +195,47 @@ class ELBOKTOTrainer(Trainer):
         n_local = torch.tensor([x.numel()], device=x.device, dtype=torch.long)
         dist.all_reduce(n_local, op=dist.ReduceOp.SUM)
         return s / n_local.to(s.dtype)
+
+    def _grouped_mean_1d(self, x: torch.Tensor, group_size: int) -> torch.Tensor:
+        """
+        Per-sample centering baseline computed within contiguous groups of size
+        `group_size` over the rank-ordered global batch.
+
+        The global batch is formed by all-gathering `x` in rank order
+        (rank 0's samples, then rank 1's, ...), cut into contiguous chunks of
+        `group_size`, and each sample is centered by the mean of its own chunk.
+        Returns a detached tensor aligned to this rank's local samples
+        (same shape as `x`).
+        """
+        x = x.detach()
+        local_B = x.numel()
+
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+            # all_gather requires equal-sized tensors across ranks
+            gathered = [torch.zeros_like(x) for _ in range(world_size)]
+            dist.all_gather(gathered, x)
+            g = torch.cat(gathered, dim=0)      # [world_size * local_B], rank order
+            start = rank * local_B
+        else:
+            g = x
+            start = 0
+
+        N = g.numel()
+        if group_size <= 0:
+            # off => single global mean broadcast to this rank's samples
+            return g.mean().expand(local_B).contiguous()
+        if N % group_size != 0:
+            raise RuntimeError(
+                f"centering_group_size={group_size} does not divide the global batch "
+                f"size N={N}. Choose a cgs that divides the (world_size x "
+                f"per_device_train_batch_size) global batch."
+            )
+        n_groups = N // group_size
+        group_means = g.view(n_groups, group_size).mean(dim=1)   # [n_groups]
+        per_pos = group_means.repeat_interleave(group_size)      # [N], grouped in global order
+        return per_pos[start:start + local_B].contiguous()
 
     # ---- core math ----
     def _logp_mean_over_mask(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.BoolTensor) -> torch.Tensor:
@@ -353,7 +395,12 @@ class ELBOKTOTrainer(Trainer):
         if z0_mode == "zero":
             z0 = torch.zeros((), device=x.device, dtype=r_hat.dtype)
         elif z0_mode == "global_mean":
-            z0 = self._global_mean_1d(r_hat)
+            cgs = int(getattr(self, "centering_group_size", 0) or 0)
+            if cgs > 0:
+                # center within contiguous groups of size cgs over the global batch
+                z0 = self._grouped_mean_1d(r_hat, cgs)   # [B] per-sample, detached
+            else:
+                z0 = self._global_mean_1d(r_hat)         # scalar, detached
         else:
             raise ValueError(f"Unknown z0_mode: {z0_mode}")
 
@@ -391,7 +438,7 @@ class ELBOKTOTrainer(Trainer):
         loss = (lambdas - v).mean()
 
         if return_outputs:
-            return loss, {"r_mean_local": r_hat.detach().mean(), "z0": z0.detach()}
+            return loss, {"r_mean_local": r_hat.detach().mean(), "z0": z0.detach().mean()}
         return loss
 
 # ======================
@@ -430,6 +477,13 @@ def parse_args():
     p.add_argument("--kto_lambda_D", type=float, default=1.0)
     p.add_argument("--kto_lambda_U", type=float, default=1.0)
     p.add_argument("--z0_mode", type=str, default="global_mean", choices=["global_mean", "zero"])
+    p.add_argument("--centering_group_size", "--cgs", type=int, default=0, dest="centering_group_size",
+                   help="Size of contiguous groups over the rank-ordered global batch used to compute the KTO "
+                        "centering baseline z0. 0 (default) => a single global mean (original behavior). "
+                        "E.g. with global batch 8, cgs=2 => 4 groups of 2, each centered by its own group mean. "
+                        "Only applies when --z0_mode=global_mean. The global batch "
+                        "(world_size x per_device_train_batch_size) must be divisible by cgs. "
+                        "Note: cgs=1 centers each sample by itself and zeroes the training signal.")
     p.add_argument("--verify_masks", action="store_true", default=True)
     p.add_argument("--disable_mask_verification", action="store_true", default=False,
                    help="Disable mask verification for faster training (production mode)")
@@ -515,6 +569,23 @@ def main():
         raise ValueError("Both n_D and n_U cannot be 0.0 - at least one sample type must be used")
     
     init_distributed()
+
+    # Validate centering group size (grouped KTO baseline)
+    if args.centering_group_size and args.centering_group_size > 0:
+        ws = dist.get_world_size() if dist.is_initialized() else 1
+        global_bs = ws * args.per_device_train_batch_size
+        if global_bs % args.centering_group_size != 0:
+            raise ValueError(
+                f"--centering_group_size={args.centering_group_size} must divide the global batch size "
+                f"(world_size {ws} x per_device_train_batch_size {args.per_device_train_batch_size} "
+                f"= {global_bs})."
+            )
+        if args.z0_mode != "global_mean" and is_main_process():
+            print(f"[WARN] --centering_group_size={args.centering_group_size} is ignored because "
+                  f"--z0_mode={args.z0_mode} (grouped centering only applies to global_mean).")
+        if args.centering_group_size == 1 and is_main_process():
+            print("[WARN] --centering_group_size=1 centers each sample by itself -> the centered margin "
+                  "is 0 and the training signal vanishes.")
 
     # Load tokenizer/model
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
@@ -607,6 +678,7 @@ def main():
     trainer.kto_lambda_D = args.kto_lambda_D
     trainer.kto_lambda_U = args.kto_lambda_U
     trainer.z0_mode = args.z0_mode
+    trainer.centering_group_size = args.centering_group_size
     trainer.verify_masks = args.verify_masks and not args.disable_mask_verification
 
     # Generalization runtime ids
