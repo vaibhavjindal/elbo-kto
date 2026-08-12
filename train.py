@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-import os, argparse
+import os, argparse, random
 from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
+from torch.utils.data import Sampler
  
 
 from transformers import (
@@ -160,6 +161,154 @@ def make_fixedl_masks_batched(
     return masks
 
 # ===========================
+# Global-batch class composition sampler
+# ===========================
+
+def _interleave_pattern(n_desired: int, n_undesired: int) -> List[int]:
+    """Alternate 1/0 while both classes remain, then append the leftovers."""
+    pattern = []
+    while n_desired > 0 or n_undesired > 0:
+        if n_desired > 0:
+            pattern.append(1)
+            n_desired -= 1
+        if n_undesired > 0:
+            pattern.append(0)
+            n_undesired -= 1
+    return pattern
+
+
+class ClassCompositionSampler(Sampler):
+    """
+    Emits a flat index order whose consecutive groups of ``group_size`` are the global
+    batches actually seen by ``compute_loss``.
+
+    accelerate's ``BatchSamplerShard(split_batches=False)`` hands per-device batch ``j`` to
+    rank ``j % world_size``, so flat position ``j * group_size + r * per_device_bs`` lands on
+    rank ``r`` at optimizer step ``j``. Controlling this order therefore controls the exact
+    desired/undesired composition of every global batch, which is what determines the
+    stop-gradient global baseline ``z0 = mean(r_hat)`` (all-reduced across ranks).
+
+    ``group_size`` must be ``world_size * per_device_train_batch_size``. Gradient accumulation
+    is deliberately excluded: ``z0`` is all-reduced once per micro-step, so the micro-step is
+    the unit whose composition matters.
+
+    Modes:
+      - ``balanced``:    every global batch has ``desired_per_batch`` desired samples.
+      - ``alternating``: global batches are homogeneous, alternating all-desired / all-undesired.
+
+    Both classes are consumed fully; once one class is exhausted the remaining batches are
+    filled from the other class (off-spec tail), and the trailing remainder that cannot fill a
+    whole global batch is dropped.
+    """
+
+    def __init__(self, labels, group_size: int, mode: str,
+                 desired_per_batch: Optional[int] = None, seed: int = 42):
+        if group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {group_size}")
+        if mode not in ("balanced", "alternating"):
+            raise ValueError(f"Unknown composition mode: {mode}")
+
+        self.group_size = int(group_size)
+        self.mode = mode
+        self.seed = int(seed)
+        self.epoch = 0
+
+        labels = [int(l) for l in labels]
+        self.desired_idx = [i for i, l in enumerate(labels) if l == 1]
+        self.undesired_idx = [i for i, l in enumerate(labels) if l != 1]
+
+        if mode == "balanced":
+            if desired_per_batch is None:
+                desired_per_batch = self.group_size // 2
+            if not (0 <= desired_per_batch <= self.group_size):
+                raise ValueError(
+                    f"desired_per_batch must be in [0, {self.group_size}], got {desired_per_batch}"
+                )
+            self.desired_per_batch = int(desired_per_batch)
+        else:
+            self.desired_per_batch = None
+
+        n_total = len(self.desired_idx) + len(self.undesired_idx)
+        self.num_groups = n_total // self.group_size
+        self._num_samples = self.num_groups * self.group_size
+        self.n_dropped = n_total - self._num_samples
+
+    def set_epoch(self, epoch: int):
+        """Called by accelerate's DataLoaderShard so multi-epoch runs reshuffle."""
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return self._num_samples
+
+    def _requested_pattern(self, group: int) -> List[int]:
+        if self.mode == "balanced":
+            return _interleave_pattern(self.desired_per_batch,
+                                       self.group_size - self.desired_per_batch)
+        return [1] * self.group_size if group % 2 == 0 else [0] * self.group_size
+
+    def build_order(self) -> List[int]:
+        """Deterministic given (seed, epoch) so every rank builds the identical order."""
+        rng = random.Random(self.seed + 1000003 * self.epoch)
+        desired = list(self.desired_idx)
+        undesired = list(self.undesired_idx)
+        rng.shuffle(desired)
+        rng.shuffle(undesired)
+
+        di = ui = 0
+        order = []
+        for g in range(self.num_groups):
+            for want in self._requested_pattern(g):
+                if want == 1 and di < len(desired):
+                    order.append(desired[di]); di += 1
+                elif want == 0 and ui < len(undesired):
+                    order.append(undesired[ui]); ui += 1
+                elif di < len(desired):          # requested class exhausted -> off-spec fill
+                    order.append(desired[di]); di += 1
+                else:
+                    order.append(undesired[ui]); ui += 1
+        return order
+
+    def __iter__(self):
+        return iter(self.build_order())
+
+    def describe(self, world_size: int, per_device_bs: int, n_preview: int = 4) -> str:
+        """Human-readable realized composition, for verifying an experiment before it burns GPU hours."""
+        order = self.build_order()
+        desired_set = set(self.desired_idx)
+        lines = [
+            f"[composition] mode={self.mode} group_size={self.group_size} "
+            f"(world_size={world_size} x per_device_bs={per_device_bs})",
+            f"[composition] pool: {len(self.desired_idx)} desired, {len(self.undesired_idx)} undesired "
+            f"-> {self.num_groups} global batches, {self.n_dropped} trailing samples dropped",
+        ]
+
+        off_spec = []
+        for g in range(self.num_groups):
+            grp = order[g * self.group_size:(g + 1) * self.group_size]
+            got = [1 if i in desired_set else 0 for i in grp]
+            if got != self._requested_pattern(g):
+                off_spec.append(g)
+
+        if off_spec:
+            lines.append(
+                f"[composition] WARNING: {len(off_spec)} / {self.num_groups} batches are off-spec "
+                f"(a class ran out); first off-spec step = {off_spec[0]}"
+            )
+        else:
+            lines.append(f"[composition] all {self.num_groups} batches match the requested composition")
+
+        for g in range(min(n_preview, self.num_groups)):
+            grp = order[g * self.group_size:(g + 1) * self.group_size]
+            got = [1 if i in desired_set else 0 for i in grp]
+            per_rank = [got[r * per_device_bs:(r + 1) * per_device_bs] for r in range(world_size)]
+            lines.append(
+                f"[composition]   step {g}: n_desired={sum(got)}/{self.group_size} "
+                f"per-rank labels={per_rank}"
+            )
+        return "\n".join(lines)
+
+
+# ===========================
 # KTO Trainer (no ref model)
 # ===========================
 
@@ -180,8 +329,40 @@ class ELBOKTOTrainer(Trainer):
     kto_lambda_U: float = 1.0
     z0_mode: str = "global_mean"  # or "zero"
 
+    # Global-batch class composition (see ClassCompositionSampler)
+    batch_composition: str = "random"       # random | balanced | alternating
+    composition_seed: int = 42
+    desired_per_batch: Optional[int] = None
+
     # Extra runtime attributes set by runner for generalization
     mask_token_id: Optional[int] = None
+
+    # ---- data ordering ----
+    def _get_train_sampler(self, train_dataset=None) -> Optional[torch.utils.data.Sampler]:
+        """Override the default RandomSampler to control per-global-batch class composition.
+
+        accelerate's prepare_data_loader only replaces samplers that are exactly a
+        `RandomSampler`, so a custom Sampler subclass is passed through untouched.
+        """
+        if getattr(self, "batch_composition", "random") == "random":
+            return super()._get_train_sampler(train_dataset)
+
+        if train_dataset is None:
+            train_dataset = self.train_dataset
+
+        try:
+            labels = train_dataset["labels"]
+        except (TypeError, KeyError):
+            labels = [train_dataset[i]["labels"] for i in range(len(train_dataset))]
+
+        group_size = self.args.world_size * self._train_batch_size
+        return ClassCompositionSampler(
+            labels=labels,
+            group_size=group_size,
+            mode=self.batch_composition,
+            desired_per_batch=self.desired_per_batch,
+            seed=self.composition_seed,
+        )
 
     # ---- utilities ----
     def _global_mean_1d(self, x: torch.Tensor):
@@ -371,6 +552,7 @@ class ELBOKTOTrainer(Trainer):
             sat6 = self._global_mean_1d((abs_beta_s > 6).float())
             sat8 = self._global_mean_1d((abs_beta_s > 8).float())
             mean_len_resp = self._global_mean_1d(cl.float())
+            frac_desired = self._global_mean_1d((y == 1).float())
 
         if is_main_process():
             self.log({
@@ -380,6 +562,7 @@ class ELBOKTOTrainer(Trainer):
                 "abs_beta_s/frac>6": sat6.item(),
                 "abs_beta_s/frac>8": sat8.item(),
                 "resp_len/mean":     mean_len_resp.item(),
+                "batch/frac_desired": frac_desired.item(),
             })
 
         # KTO loss
@@ -448,6 +631,22 @@ def parse_args():
     p.add_argument("--sample_seed", type=int, default=42,
                    help="Random seed for reproducible dataset sampling when n_D or n_U < 1.0")
 
+    # Global-batch class composition
+    p.add_argument("--batch_composition", type=str, default="random",
+                   choices=["random", "balanced", "alternating"],
+                   help="Desired/undesired composition of each global batch (the unit over which "
+                        "z0 is all-reduced). 'random' = stock HF RandomSampler. "
+                        "'balanced' = every global batch has --desired_per_batch desired samples. "
+                        "'alternating' = homogeneous batches alternating all-desired / all-undesired.")
+    p.add_argument("--desired_per_batch", type=int, default=None,
+                   help="Number of desired samples per global batch when --batch_composition=balanced. "
+                        "Defaults to half the global batch (e.g. 4 of 8 on 8 GPUs with microbatch 1).")
+    p.add_argument("--composition_seed", type=int, default=42,
+                   help="Seed for the within-class shuffle used by --batch_composition")
+    p.add_argument("--print_batch_composition", type=int, default=4,
+                   help="Print the realized composition of the first N global batches at startup "
+                        "(0 to disable). Verification only; does not affect training.")
+
     return p.parse_args()
 
 def create_training_args(args) -> TrainingArguments:
@@ -482,6 +681,10 @@ def create_training_args(args) -> TrainingArguments:
         lr_scheduler_type="cosine",
         fsdp=args.fsdp,
         fsdp_config=fsdp_cfg,
+        # A partial trailing global batch would make z0 a mean over fewer samples and would
+        # trip accelerate's even_batches tail-cycling, which recycles early samples and breaks
+        # the requested composition.
+        dataloader_drop_last=(args.batch_composition != "random"),
         report_to=[],  # Disable all logging integrations (MLflow, wandb, etc.)
     )
 
@@ -609,8 +812,21 @@ def main():
     trainer.z0_mode = args.z0_mode
     trainer.verify_masks = args.verify_masks and not args.disable_mask_verification
 
+    # Global-batch class composition knobs (must be set before get_train_dataloader runs)
+    trainer.batch_composition = args.batch_composition
+    trainer.composition_seed = args.composition_seed
+    trainer.desired_per_batch = args.desired_per_batch
+
     # Generalization runtime ids
     trainer.mask_token_id = _resolve_mask_token_id(tok, model)
+
+    if args.batch_composition != "random" and args.print_batch_composition > 0 and is_main_process():
+        sampler = trainer._get_train_sampler(train_ds)
+        print(sampler.describe(
+            world_size=train_args.world_size,
+            per_device_bs=trainer._train_batch_size,
+            n_preview=args.print_batch_composition,
+        ))
 
     if is_main_process():
         print("Starting training...")
