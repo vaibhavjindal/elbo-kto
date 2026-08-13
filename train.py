@@ -233,6 +233,15 @@ class ClassCompositionSampler(Sampler):
         self._num_samples = self.num_groups * self.group_size
         self.n_dropped = n_total - self._num_samples
 
+        if self.num_groups == 0:
+            raise ValueError(
+                f"--batch_composition={mode} needs at least one full global batch, but the "
+                f"training set has only {n_total} samples for a global batch of {self.group_size} "
+                f"(world_size x per_device_train_batch_size). Every batch would be dropped and "
+                f"training would silently run zero steps. Use more data, lower "
+                f"--per_device_train_batch_size, or relax --n_D/--n_U."
+            )
+
     def set_epoch(self, epoch: int):
         """Called by accelerate's DataLoaderShard so multi-epoch runs reshuffle."""
         self.epoch = int(epoch)
@@ -241,6 +250,8 @@ class ClassCompositionSampler(Sampler):
         return self._num_samples
 
     def _requested_pattern(self, group: int) -> List[int]:
+        """``group`` is the absolute group index across epochs, so the alternating phase
+        stays continuous over an epoch boundary even when num_groups is odd."""
         if self.mode == "balanced":
             return _interleave_pattern(self.desired_per_batch,
                                        self.group_size - self.desired_per_batch)
@@ -256,8 +267,9 @@ class ClassCompositionSampler(Sampler):
 
         di = ui = 0
         order = []
+        phase = self.epoch * self.num_groups
         for g in range(self.num_groups):
-            for want in self._requested_pattern(g):
+            for want in self._requested_pattern(phase + g):
                 if want == 1 and di < len(desired):
                     order.append(desired[di]); di += 1
                 elif want == 0 and ui < len(undesired):
@@ -286,7 +298,7 @@ class ClassCompositionSampler(Sampler):
         for g in range(self.num_groups):
             grp = order[g * self.group_size:(g + 1) * self.group_size]
             got = [1 if i in desired_set else 0 for i in grp]
-            if got != self._requested_pattern(g):
+            if got != self._requested_pattern(self.epoch * self.num_groups + g):
                 off_spec.append(g)
 
         if off_spec:

@@ -109,10 +109,19 @@ Notes:
 - Every logged step now includes `batch/frac_desired`, so the realized composition is visible in
   the training logs (expect a constant `0.5` for experiment 1, and `1.0`/`0.0` alternating for
   experiment 2).
-- In `alternating`, an all-desired batch has `s_i = beta * (r_hat_i - mean(r_hat))` with every
-  `s_i` sign `+1` and a zero-mean argument, so roughly half of the desired samples are pushed
-  down at each step. This is expected behavior of the batch-mean baseline under a homogeneous
-  batch, not a bug — it is precisely what the experiment probes.
+- In `alternating`, `z0` becomes a *within-class* mean, so the centered scores `s_i` are zero-mean
+  inside every batch. Because `z0` is stop-gradient, this does **not** flip any sample's update
+  direction: on a desired step every sample's ELBO is pushed up, on an undesired step every
+  sample's ELBO is pushed down. What centering does is put every sample at the steepest part of
+  the sigmoid, so the per-sample gradient weights are near-maximal and nearly uniform
+  (`sigma'(0) = 0.25`). The baseline therefore stops contrasting the two classes within a step,
+  and the contrast is spread across consecutive steps instead — which is exactly what this
+  experiment probes.
+- `alternating` keeps its phase continuous across epoch boundaries (parity is computed from an
+  absolute group index), so an odd number of batches per epoch does not produce two consecutive
+  all-desired steps.
+- These modes require at least one full global batch of data after `--n_D`/`--n_U` filtering;
+  otherwise the run fails fast with an explicit error instead of silently training zero steps.
 
 ### 5) Reproducibility
 - Mask generation is deterministic per example using fixed 64-bit seeds; training re-derives the same per-draw masks and verifies them (configurable).
