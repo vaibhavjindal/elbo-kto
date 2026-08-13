@@ -60,6 +60,47 @@ Key points:
 - `--train_dataset_path` must point to the JSONL created in the precompute step.
 - `--n_mc_samples` must be one of the K values you precomputed.
 
+#### Baseline (z0) variants
+
+The KTO value function centers each ELBO margin `r̂ = B̂_πθ − B̂_πref` by a stop-gradient
+baseline `z0`. Select it with `--baseline_type`:
+
+| `--baseline_type` | z0 for example *i* | Notes |
+| --- | --- | --- |
+| `batch_mean` (default) | mean of `r̂` over the current **global** batch | Paper default; variance-optimal among batch-constant baselines (Lemma 1) |
+| `none` | `0` | No centering |
+| `running_global` | `b_{t-1}` | EMA over past global batch margin means |
+| `running_class_conditional` | `b^D_{t-1}` if desirable, else `b^U_{t-1}` | Two independent EMAs |
+
+The running variants use `b_t = decay * b_{t-1} + (1 - decay) * r̄_t`, with `b_0 = 0` and
+`decay` set by `--baseline_ema_decay` (default `0.99`). The value applied to batch *t* is
+the EMA from **before** that batch; the EMA is updated only after the batch loss has been
+computed. Margin means are all-reduced across ranks first, so every rank holds an identical
+baseline. For `running_class_conditional`, a class that is absent from the global batch
+leaves its EMA untouched. All baselines are stop-gradient.
+
+```
+torchrun --nproc_per_node=8 train.py \
+  --model_name_or_path GSAI-ML/LLaDA-8B-Instruct \
+  --train_dataset_path data/kto-mix-14k-processed/train.jsonl \
+  --n_mc_samples 8 --kto_beta 0.1 --learning_rate 1e-6 \
+  --baseline_type running_class_conditional --baseline_ema_decay 0.99 \
+  --output_dir models/elbo-kto-running-cc
+```
+
+Baselines are logged every `--logging_steps` for inspection: `baseline/z0_used_mean`
+(the baseline actually applied), `baseline/ema_global` or `baseline/ema_D` +
+`baseline/ema_U`, plus `baseline/margin_mean_D|U` and `baseline/n_D|n_U`.
+
+`--z0_mode` is still accepted as a deprecated alias (`global_mean` → `batch_mean`,
+`zero` → `none`).
+
+Baseline behavior is covered by `tests/test_baselines.py` (unit) and
+`tests/test_train_smoke.py` (end-to-end `train()` loop); both run under `torchrun`:
+```
+torchrun --nproc_per_node=8 tests/test_baselines.py
+```
+
 ### 5) Reproducibility
 - Mask generation is deterministic per example using fixed 64-bit seeds; training re-derives the same per-draw masks and verifies them (configurable).
 - BF16 is enabled by default; adjust per hardware if needed.

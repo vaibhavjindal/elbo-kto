@@ -18,6 +18,30 @@ from transformers import (
 from data_utils import DataProcessorPreprocessed
 
 MAX_LENGTH = 4096
+
+# =========================
+# Baseline (z0) variants
+# =========================
+
+BASELINE_TYPES = ("batch_mean", "none", "running_global", "running_class_conditional")
+
+# Legacy --z0_mode values -> new --baseline_type values (behavior is identical).
+_LEGACY_BASELINE_ALIASES = {"global_mean": "batch_mean", "zero": "none"}
+
+
+def normalize_baseline_type(value: str) -> str:
+    """Map legacy z0_mode names onto baseline_type names and validate."""
+    if value is None:
+        raise ValueError("baseline type cannot be None")
+    v = _LEGACY_BASELINE_ALIASES.get(value, value)
+    if v not in BASELINE_TYPES:
+        raise ValueError(
+            f"Unknown baseline type {value!r}. Expected one of {list(BASELINE_TYPES)} "
+            f"(or legacy {list(_LEGACY_BASELINE_ALIASES)})."
+        )
+    return v
+
+
 # =========================
 # Custom Data Collator
 # =========================
@@ -169,8 +193,17 @@ class ELBOKTOTrainer(Trainer):
       - Rebuilds the exact fixed-ℓ masks per draw k using stored seeds + ℓ,
       - Computes B_theta via mean log-prob over masked tokens,
       - Uses precomputed bref_K from dataset,
-      - Computes KTO loss with global-mean z0 baseline,
+      - Computes KTO loss with a configurable stop-gradient z0 baseline,
       - Optionally verifies masked index sums match the precompute (debug).
+
+    Baseline variants (``baseline_type``):
+      - "batch_mean"                : z0 = mean of the current global batch margins (default).
+      - "none"                      : z0 = 0.
+      - "running_global"            : z0 = EMA of past global batch margin means.
+      - "running_class_conditional" : separate EMAs for desirable / undesirable examples.
+
+    The running variants use the EMA value from *before* the current batch, and are
+    updated only after the batch loss has been computed.
     """
     # public knobs (set after construction if desired)
     verify_masks: bool = True   # compare sum(masked idx) with stored values; raise on mismatch
@@ -178,7 +211,15 @@ class ELBOKTOTrainer(Trainer):
     kto_beta: float = 0.1
     kto_lambda_D: float = 1.0
     kto_lambda_U: float = 1.0
-    z0_mode: str = "global_mean"  # or "zero"
+    baseline_type: str = "batch_mean"
+    baseline_ema_decay: float = 0.99
+    z0_mode: Optional[str] = None  # deprecated alias for baseline_type
+
+    # Running baseline state (stop-grad scalars, identical on every rank because they are
+    # only ever updated from all-reduced quantities). Initialized to 0.
+    _baseline_ema_global: float = 0.0
+    _baseline_ema_D: float = 0.0
+    _baseline_ema_U: float = 0.0
 
     # Extra runtime attributes set by runner for generalization
     mask_token_id: Optional[int] = None
@@ -194,6 +235,74 @@ class ELBOKTOTrainer(Trainer):
         n_local = torch.tensor([x.numel()], device=x.device, dtype=torch.long)
         dist.all_reduce(n_local, op=dist.ReduceOp.SUM)
         return s / n_local.to(s.dtype)
+
+    # ---- baseline helpers ----
+    def _resolve_baseline_type(self) -> str:
+        """Resolve baseline_type, honoring the deprecated z0_mode alias."""
+        legacy = getattr(self, "z0_mode", None)
+        if legacy is not None:
+            return normalize_baseline_type(legacy)
+        return normalize_baseline_type(getattr(self, "baseline_type", "batch_mean"))
+
+    def _global_class_stats(self, r_hat: torch.Tensor, good: torch.Tensor) -> torch.Tensor:
+        """
+        Reduce [sum_D, n_D, sum_U, n_U] over all ranks in a single collective.
+
+        MUST be called by every rank, unconditionally and in the same order, or NCCL
+        deadlocks. Any "is this class present?" decision must therefore be made from the
+        *reduced* result, never from rank-local data.
+        """
+        r = r_hat.detach().float()
+        d = good.to(r.dtype)
+        u = 1.0 - d
+        stats = torch.stack([(r * d).sum(), d.sum(), (r * u).sum(), u.sum()])
+        if dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        return stats
+
+    def _baseline_z0(self, r_hat: torch.Tensor, good: torch.Tensor, mode: str) -> torch.Tensor:
+        """
+        Stop-gradient baseline z0 used to center the margins for this batch.
+
+        Scalar for every mode except "running_class_conditional", which returns [B].
+        Running modes deliberately return the EMA value from *before* this batch.
+        """
+        if mode == "none":
+            return torch.zeros((), device=r_hat.device, dtype=r_hat.dtype)
+        if mode == "batch_mean":
+            return self._global_mean_1d(r_hat)
+        if mode == "running_global":
+            return torch.full((), float(self._baseline_ema_global),
+                              device=r_hat.device, dtype=r_hat.dtype)
+        if mode == "running_class_conditional":
+            bD = torch.full((), float(self._baseline_ema_D), device=r_hat.device, dtype=r_hat.dtype)
+            bU = torch.full((), float(self._baseline_ema_U), device=r_hat.device, dtype=r_hat.dtype)
+            return torch.where(good, bD, bU)
+        raise ValueError(f"Unknown baseline_type: {mode}")
+
+    def _update_running_baselines(self, stats, mode: str) -> None:
+        """
+        EMA update b_t = decay * b_{t-1} + (1 - decay) * mean_margin_t.
+
+        `stats` is (sum_D, n_D, sum_U, n_U), already reduced across ranks, so every rank
+        takes the same branch and the EMAs stay in lockstep. A class absent from the
+        *global* batch is skipped.
+        """
+        if mode not in ("running_global", "running_class_conditional"):
+            return
+        decay = float(self.baseline_ema_decay)
+        sum_D, n_D, sum_U, n_U = stats
+
+        if mode == "running_global":
+            n = n_D + n_U
+            if n > 0:
+                mean_r = (sum_D + sum_U) / n
+                self._baseline_ema_global = decay * self._baseline_ema_global + (1.0 - decay) * mean_r
+        else:
+            if n_D > 0:
+                self._baseline_ema_D = decay * self._baseline_ema_D + (1.0 - decay) * (sum_D / n_D)
+            if n_U > 0:
+                self._baseline_ema_U = decay * self._baseline_ema_U + (1.0 - decay) * (sum_U / n_U)
 
     # ---- core math ----
     def _logp_mean_over_mask(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.BoolTensor) -> torch.Tensor:
@@ -237,7 +346,7 @@ class ELBOKTOTrainer(Trainer):
         beta = getattr(self, "kto_beta", 0.1)
         lambda_D = getattr(self, "kto_lambda_D", 1.0)
         lambda_U = getattr(self, "kto_lambda_U", 1.0)
-        z0_mode = getattr(self, "z0_mode", "global_mean")
+        baseline_type = self._resolve_baseline_type()
         verify = getattr(self, "verify_masks", True)
 
         # runtime ids
@@ -349,15 +458,28 @@ class ELBOKTOTrainer(Trainer):
         B_theta = torch.stack(btheta_terms, dim=0).mean(dim=0)           # [B]
         r_hat = B_theta - bref_K                    # [B]
 
-        # z0 baseline
-        if z0_mode == "zero":
-            z0 = torch.zeros((), device=x.device, dtype=r_hat.dtype)
-        elif z0_mode == "global_mean":
-            z0 = self._global_mean_1d(r_hat)
-        else:
-            raise ValueError(f"Unknown z0_mode: {z0_mode}")
+        good = (y == 1)
+
+        # z0 baseline (stop-grad). Running variants use the value from *before* this batch.
+        z0 = self._baseline_z0(r_hat, good, baseline_type)
 
         s = beta * (r_hat - z0)                     # [B]
+
+        # KTO loss
+        v = torch.empty_like(s)
+        v[good]  = lambda_D * torch.sigmoid(s[good])
+        v[~good] = lambda_U * torch.sigmoid(-s[~good])
+        lambdas = lambda_D * good.float() + lambda_U * (~good).float()
+        loss = (lambdas - v).mean()
+
+        # ---- running baseline EMA update: strictly after the batch loss is computed ----
+        # The collective runs on every rank in every mode so that all ranks issue the same
+        # sequence of collectives; only the *use* of the result is mode-dependent.
+        class_stats = self._global_class_stats(r_hat, good)
+        sum_D, n_D, sum_U, n_U = (float(t) for t in class_stats.tolist())
+        if getattr(model, "training", True):
+            # Do not let evaluation batches pollute the running baselines.
+            self._update_running_baselines((sum_D, n_D, sum_U, n_U), baseline_type)
 
         with torch.no_grad():
             abs_beta_r = (beta * r_hat).abs().float()          # [B]
@@ -371,24 +493,30 @@ class ELBOKTOTrainer(Trainer):
             sat6 = self._global_mean_1d((abs_beta_s > 6).float())
             sat8 = self._global_mean_1d((abs_beta_s > 8).float())
             mean_len_resp = self._global_mean_1d(cl.float())
+            # expand so a class-conditional (per-example) z0 is example-weighted globally
+            z0_used_mean = self._global_mean_1d(z0.detach().float().expand_as(r_hat))
 
         if is_main_process():
-            self.log({
+            logs = {
                 "abs_beta_r/mean":   mean_abs_beta_r.item(),
                 "abs_beta_s/mean":   mean_abs_beta_s.item(),
                 "abs_r_hat_z0/mean": mean_abs_r_hat_z0.item(),
                 "abs_beta_s/frac>6": sat6.item(),
                 "abs_beta_s/frac>8": sat8.item(),
                 "resp_len/mean":     mean_len_resp.item(),
-            })
-
-        # KTO loss
-        good = (y == 1)
-        v = torch.empty_like(s)
-        v[good]  = lambda_D * torch.sigmoid(s[good])
-        v[~good] = lambda_U * torch.sigmoid(-s[~good])
-        lambdas = lambda_D * good.float() + lambda_U * (~good).float()
-        loss = (lambdas - v).mean()
+                # baseline telemetry
+                "baseline/z0_used_mean": z0_used_mean.item(),
+                "baseline/n_D": n_D,
+                "baseline/n_U": n_U,
+                "baseline/margin_mean_D": (sum_D / n_D) if n_D > 0 else float("nan"),
+                "baseline/margin_mean_U": (sum_U / n_U) if n_U > 0 else float("nan"),
+            }
+            if baseline_type == "running_global":
+                logs["baseline/ema_global"] = float(self._baseline_ema_global)
+            elif baseline_type == "running_class_conditional":
+                logs["baseline/ema_D"] = float(self._baseline_ema_D)
+                logs["baseline/ema_U"] = float(self._baseline_ema_U)
+            self.log(logs)
 
         if return_outputs:
             return loss, {"r_mean_local": r_hat.detach().mean(), "z0": z0.detach()}
@@ -429,7 +557,16 @@ def parse_args():
     p.add_argument("--kto_beta", type=float, default=0.2)
     p.add_argument("--kto_lambda_D", type=float, default=1.0)
     p.add_argument("--kto_lambda_U", type=float, default=1.0)
-    p.add_argument("--z0_mode", type=str, default="global_mean", choices=["global_mean", "zero"])
+    p.add_argument("--z0_mode", type=str, default=None, choices=["global_mean", "zero"],
+                   help="DEPRECATED alias for --baseline_type ('global_mean'->'batch_mean', 'zero'->'none').")
+    p.add_argument("--baseline_type", type=str, default=None, choices=list(BASELINE_TYPES),
+                   help="Stop-gradient z0 baseline used to center ELBO margins. "
+                        "'batch_mean' (default): mean margin of the current global batch. "
+                        "'none': 0. "
+                        "'running_global': EMA over past global batch margin means. "
+                        "'running_class_conditional': separate EMAs for desirable/undesirable.")
+    p.add_argument("--baseline_ema_decay", type=float, default=0.99,
+                   help="EMA decay for the running baselines: b_t = decay*b_{t-1} + (1-decay)*mean_margin_t")
     p.add_argument("--verify_masks", action="store_true", default=True)
     p.add_argument("--disable_mask_verification", action="store_true", default=False,
                    help="Disable mask verification for faster training (production mode)")
@@ -449,6 +586,33 @@ def parse_args():
                    help="Random seed for reproducible dataset sampling when n_D or n_U < 1.0")
 
     return p.parse_args()
+
+def resolve_baseline_args(args):
+    """
+    Resolve --baseline_type / deprecated --z0_mode into args.baseline_type, and validate
+    the EMA decay. Returns the resolved baseline type.
+    """
+    if args.baseline_type is not None and args.z0_mode is not None:
+        resolved = normalize_baseline_type(args.baseline_type)
+        if normalize_baseline_type(args.z0_mode) != resolved:
+            raise ValueError(
+                f"--baseline_type={args.baseline_type} conflicts with deprecated "
+                f"--z0_mode={args.z0_mode}. Pass only --baseline_type."
+            )
+        args.baseline_type = resolved
+    elif args.z0_mode is not None:
+        args.baseline_type = normalize_baseline_type(args.z0_mode)
+        print(f"[WARN] --z0_mode is deprecated; using --baseline_type={args.baseline_type}")
+    else:
+        args.baseline_type = normalize_baseline_type(args.baseline_type or "batch_mean")
+
+    if not (0.0 <= args.baseline_ema_decay < 1.0):
+        raise ValueError(
+            f"baseline_ema_decay must be in [0.0, 1.0), got {args.baseline_ema_decay}"
+        )
+    args.z0_mode = None  # consumed; the trainer reads baseline_type only
+    return args.baseline_type
+
 
 def create_training_args(args) -> TrainingArguments:
     fsdp_cfg = {
@@ -513,6 +677,9 @@ def main():
         raise ValueError(f"n_U must be between 0.0 and 1.0 (inclusive), got {args.n_U}")
     if args.n_D == 0.0 and args.n_U == 0.0:
         raise ValueError("Both n_D and n_U cannot be 0.0 - at least one sample type must be used")
+
+    # Resolve baseline type (--baseline_type wins; --z0_mode kept as a deprecated alias)
+    resolve_baseline_args(args)
     
     init_distributed()
 
@@ -606,8 +773,9 @@ def main():
     trainer.kto_beta = args.kto_beta
     trainer.kto_lambda_D = args.kto_lambda_D
     trainer.kto_lambda_U = args.kto_lambda_U
-    trainer.z0_mode = args.z0_mode
-    trainer.verify_masks = args.verify_masks and not args.disable_mask_verification
+    trainer.baseline_type = args.baseline_type
+    trainer.baseline_ema_decay = args.baseline_ema_decay
+    trainer.z0_mode = None  # resolved into baseline_type above    trainer.verify_masks = args.verify_masks and not args.disable_mask_verification
 
     # Generalization runtime ids
     trainer.mask_token_id = _resolve_mask_token_id(tok, model)
@@ -615,6 +783,7 @@ def main():
     if is_main_process():
         print("Starting training...")
         print(f"mask_token_id={trainer.mask_token_id}")
+        print(f"baseline_type={trainer.baseline_type} (ema_decay={trainer.baseline_ema_decay})")
     trainer.train()
     if is_main_process():
         print("Training completed!")
