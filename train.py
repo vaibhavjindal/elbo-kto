@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, argparse
+import os, argparse, json
 from contextlib import nullcontext
 from typing import List, Optional
 
@@ -14,6 +14,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 
 from data_utils import DataProcessorPreprocessed
 
@@ -24,6 +25,9 @@ MAX_LENGTH = 4096
 # =========================
 
 BASELINE_TYPES = ("batch_mean", "none", "running_global", "running_class_conditional")
+
+# Filename used to persist the running baseline EMAs inside a checkpoint directory.
+BASELINE_STATE_FILE = "elbo_kto_baseline_state.json"
 
 # Legacy --z0_mode values -> new --baseline_type values (behavior is identical).
 _LEGACY_BASELINE_ALIASES = {"global_mean": "batch_mean", "zero": "none"}
@@ -279,6 +283,62 @@ class ELBOKTOTrainer(Trainer):
             bU = torch.full((), float(self._baseline_ema_U), device=r_hat.device, dtype=r_hat.dtype)
             return torch.where(good, bD, bU)
         raise ValueError(f"Unknown baseline_type: {mode}")
+
+    # ---- checkpoint persistence of the running baselines ----
+    # The EMAs are plain trainer attributes, so HF's checkpointing (model / optimizer /
+    # TrainerState) does not capture them. Without this, resuming restarts every running
+    # baseline at 0 and silently re-runs the EMA warmup.
+    def _baseline_state_path(self, checkpoint_dir: str) -> str:
+        return os.path.join(checkpoint_dir, BASELINE_STATE_FILE)
+
+    def _save_checkpoint(self, model, trial, *args, **kwargs):
+        out = super()._save_checkpoint(model, trial, *args, **kwargs)
+        if self.args.should_save:
+            ckpt_dir = os.path.join(
+                self._get_output_dir(trial=trial),
+                f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}",
+            )
+            try:
+                os.makedirs(ckpt_dir, exist_ok=True)
+                with open(self._baseline_state_path(ckpt_dir), "w") as f:
+                    json.dump({
+                        "baseline_type": self._resolve_baseline_type(),
+                        "baseline_ema_decay": float(self.baseline_ema_decay),
+                        "ema_global": float(self._baseline_ema_global),
+                        "ema_D": float(self._baseline_ema_D),
+                        "ema_U": float(self._baseline_ema_U),
+                    }, f)
+            except OSError as e:
+                print(f"[WARN] could not save baseline EMA state: {e}")
+        return out
+
+    def _load_optimizer_and_scheduler(self, checkpoint):
+        # Called on every rank during resume, so all ranks read identical values and no
+        # broadcast is needed.
+        super()._load_optimizer_and_scheduler(checkpoint)
+        if not checkpoint:
+            return
+        path = self._baseline_state_path(checkpoint)
+        if not os.path.isfile(path):
+            if self._resolve_baseline_type().startswith("running"):
+                print(f"[WARN] {BASELINE_STATE_FILE} not found in {checkpoint}; "
+                      f"running baselines restart at 0.")
+            return
+        with open(path) as f:
+            st = json.load(f)
+        saved_type = st.get("baseline_type")
+        current_type = self._resolve_baseline_type()
+        if saved_type != current_type:
+            print(f"[WARN] checkpoint was trained with baseline_type={saved_type} but "
+                  f"baseline_type={current_type} was requested; not restoring EMAs.")
+            return
+        self._baseline_ema_global = float(st.get("ema_global", 0.0))
+        self._baseline_ema_D = float(st.get("ema_D", 0.0))
+        self._baseline_ema_U = float(st.get("ema_U", 0.0))
+        if is_main_process():
+            print(f"[baseline] restored EMAs from {path}: "
+                  f"global={self._baseline_ema_global:.6f} "
+                  f"D={self._baseline_ema_D:.6f} U={self._baseline_ema_U:.6f}")
 
     def _update_running_baselines(self, stats, mode: str) -> None:
         """
@@ -775,7 +835,8 @@ def main():
     trainer.kto_lambda_U = args.kto_lambda_U
     trainer.baseline_type = args.baseline_type
     trainer.baseline_ema_decay = args.baseline_ema_decay
-    trainer.z0_mode = None  # resolved into baseline_type above    trainer.verify_masks = args.verify_masks and not args.disable_mask_verification
+    trainer.z0_mode = None  # resolved into baseline_type above
+    trainer.verify_masks = args.verify_masks and not args.disable_mask_verification
 
     # Generalization runtime ids
     trainer.mask_token_id = _resolve_mask_token_id(tok, model)

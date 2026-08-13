@@ -92,6 +92,10 @@ Baselines are logged every `--logging_steps` for inspection: `baseline/z0_used_m
 (the baseline actually applied), `baseline/ema_global` or `baseline/ema_D` +
 `baseline/ema_U`, plus `baseline/margin_mean_D|U` and `baseline/n_D|n_U`.
 
+The running EMAs are saved into each checkpoint (`elbo_kto_baseline_state.json`) and
+restored on `resume_from_checkpoint`, so a resumed run does not re-run the EMA warmup.
+They are not restored if the checkpoint was trained with a different `--baseline_type`.
+
 `--z0_mode` is still accepted as a deprecated alias (`global_mean` → `batch_mean`,
 `zero` → `none`).
 

@@ -223,6 +223,31 @@ def run(device, tmpdir):
     check("absent class D keeps EMA at 0", tru._baseline_ema_D == 0.0, f"D={tru._baseline_ema_D}")
     check("present class U updated", tru._baseline_ema_U != 0.0, f"U={tru._baseline_ema_U:.6f}")
 
+    # ---- 5b. rank-LOCAL absence with GLOBAL presence ----
+    # The regression this guards: gating the EMA update on rank-local counts instead of the
+    # all-reduced counts. Half the ranks see only desirable examples, half only undesirable,
+    # yet both classes exist globally, so BOTH EMAs must update identically everywhere.
+    if dist.is_initialized() and world >= 2:
+        trm, mm = make_trainer("running_class_conditional", device, tmpdir)
+        local_labels = [1, 1] if rank % 2 == 0 else [0, 0]
+        trm.compute_loss(mm, make_batch(local_labels, device, offset))
+        check("local absence + global presence: both EMAs update",
+              trm._baseline_ema_D != 0.0 and trm._baseline_ema_U != 0.0,
+              f"D={trm._baseline_ema_D:.6f} U={trm._baseline_ema_U:.6f}")
+        buf = torch.tensor([trm._baseline_ema_D, trm._baseline_ema_U],
+                           device=device, dtype=torch.float64)
+        gathered = [torch.zeros_like(buf) for _ in range(world)]
+        dist.all_gather(gathered, buf)
+        vals = [tuple(g.tolist()) for g in gathered]
+        check("local absence + global presence: EMAs identical across ranks",
+              all(v == vals[0] for v in vals), f"n_distinct={len(set(vals))}")
+
+        # and a class genuinely absent everywhere must still be skipped under DDP
+        tra, ma = make_trainer("running_class_conditional", device, tmpdir)
+        tra.compute_loss(ma, make_batch([1, 1], device, offset))
+        check("globally absent class U skipped on every rank", tra._baseline_ema_U == 0.0,
+              f"U={tra._baseline_ema_U}")
+
     # ---- 6. eval batches must not move the EMA ----
     tre, me = make_trainer("running_global", device, tmpdir)
     me.eval()
